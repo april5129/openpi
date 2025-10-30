@@ -8,6 +8,7 @@ import time
 import numpy as np
 import cv2
 import os
+import threading
 from datetime import datetime
 from Arm_Lib import Arm_Device
 from openpi_client import websocket_client_policy
@@ -52,8 +53,14 @@ class YahboomPi05Client:
         # 当前状态 - 使用安全位置初始化
         self.joint_angles = list(self.SAFE_POSITION)
         
+        # 并行执行相关状态
+        self.joint_angles_lock = threading.Lock()  # 保护关节状态的锁
+        self.next_prediction = None  # 存储下一轮预测结果
+        self.prediction_lock = threading.Lock()  # 保护预测结果的锁
+        self.is_predicting = False  # 是否正在进行预测
+        
         # 设置图像保存目录
-        self.images_dir = "/home/yahboom/openpi/images"
+        self.images_dir = "/home/yahboom/openpi/examples/dofbot_real/images"
         os.makedirs(self.images_dir, exist_ok=True)
         self.step_counter = 0  # 用于图像文件命名
         print(f"📁 图像保存目录: {self.images_dir}")
@@ -113,7 +120,7 @@ class YahboomPi05Client:
         cap.release()
         
         if not ret:
-            # 没摄像头就用黑图，别崩溃
+            # 没摄像头就用黑图
             frame = np.zeros((480, 640, 3), dtype=np.uint8)
             original_frame = frame.copy()
         else:
@@ -124,7 +131,7 @@ class YahboomPi05Client:
             frame = cv2.resize(frame, (224, 224))
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
-        # 💾 保存图像到本地
+        # 保存图像到本地
         self._save_images(original_frame, frame)
         
         # 读取关节角度
@@ -204,9 +211,53 @@ class YahboomPi05Client:
         
         return obs
     
-    def execute_action(self, action_data):
-        """执行动作序列 - 执行完整的动作序列"""
-        if "actions" not in action_data:
+    def predict_async(self, prompt):
+        """异步预测下一轮动作"""
+        def prediction_worker():
+            try:
+                print("🔮 [异步] 开始下一轮预测...")
+                observation = self.get_observation(prompt)
+                if observation is None:
+                    print("⚠️ [异步] 无法获取观测数据")
+                    return
+                
+                start_time = time.time()
+                response = self.policy.infer(observation)
+                inference_time = time.time() - start_time
+                
+                with self.prediction_lock:
+                    self.next_prediction = {
+                        'response': response,
+                        'inference_time': inference_time,
+                        'step': self.step_counter + 1
+                    }
+                
+                print(f"🔮 [异步] 预测完成，耗时 {inference_time:.3f}s")
+                
+            except Exception as e:
+                print(f"❌ [异步] 预测失败: {e}")
+            finally:
+                self.is_predicting = False
+        
+        if not self.is_predicting:
+            self.is_predicting = True
+            thread = threading.Thread(target=prediction_worker, daemon=True)
+            thread.start()
+    
+    def get_next_prediction(self):
+        """获取异步预测的结果"""
+        with self.prediction_lock:
+            result = self.next_prediction
+            self.next_prediction = None
+            return result
+    
+    def execute_action(self, action_data, prompt=None, enable_parallel=True):
+        """执行动作序列，支持并行预测下一轮"""
+        if action_data is None:
+            print("⚠️ 收到空的动作数据")
+            return
+            
+        if not isinstance(action_data, dict) or "actions" not in action_data:
             print(f"⚠️ 动作数据中没有 'actions' 字段，可用字段: {list(action_data.keys())}")
             return
             
@@ -217,7 +268,14 @@ class YahboomPi05Client:
             print("⚠️ 收到空动作")
             return
         
-        print(f"🎯 开始执行动作序列，共 {len(actions)} 步")
+        total_steps = len(actions)
+        prediction_trigger_step = 7  # 固定在第7步启动预测
+        
+        print(f"🎯 开始执行动作序列，共 {total_steps} 步")
+        if enable_parallel and prompt:
+            print(f"📊 并行策略: 第{prediction_trigger_step}步时启动下一轮预测")
+        else:
+            print("📊 串行执行模式")
         
         # 执行完整的动作序列
         for step_idx, action in enumerate(actions):
@@ -277,7 +335,22 @@ class YahboomPi05Client:
             )
             
             # 更新状态
-            self.joint_angles = [float(a) for a in safe_angles]
+            with self.joint_angles_lock:
+                self.joint_angles = [float(a) for a in safe_angles]
+            
+            # 🔮 关键优化: 在第7步时启动下一轮预测
+            if (enable_parallel and prompt and 
+                step_idx == prediction_trigger_step - 1 and  # 第7步（索引6）
+                not self.is_predicting):                     # 还没开始预测
+                print(f"🚀 [并行] 在第{step_idx + 1}步启动下一轮预测")
+                self.predict_async(prompt)
+            
+            # 在第7步时启动异步预测
+            if (enable_parallel and prompt and 
+                step_idx + 1 == prediction_trigger_step and 
+                hasattr(self, 'start_async_prediction')):
+                print(f"🔮 第{prediction_trigger_step}步: 启动异步预测下一轮...")
+                self.start_async_prediction(prompt)
             
             # 等待动作完成
             time.sleep(0.6)  # 与执行时间匹配
@@ -303,20 +376,36 @@ class YahboomPi05Client:
                 self.step_counter += 1
                 print(f"\n🚀 === 步骤 {self.step_counter} 开始 ===")
                 
-                # 获取观测
-                obs = self.get_observation(prompt)
+                # 🔮 检查是否有异步预测结果可用
+                cached_prediction = self.get_next_prediction()
                 
-                # 显示观测数据摘要
-                joint_pos = obs["observation/joint_position"]
-                gripper_pos = obs["observation/gripper_position"]
-                image_shape = obs["observation/exterior_image_1_left"].shape
-                print(f"  📊 观测摘要: 图像{image_shape}, 关节位置{joint_pos.shape}, 夹爪位置{gripper_pos.shape}")
-                
-                # 使用openpi_client发送到服务器并接收动作
-                print("📡 正在发送观测数据到服务器...")
-                start_time = time.time()
-                action_data = self.policy.infer(obs)
-                inference_time = time.time() - start_time
+                if cached_prediction:
+                    print(f"⚡ 使用异步预测结果 (步骤 {cached_prediction['step']})")
+                    action_data = cached_prediction['response']
+                    inference_time = cached_prediction['inference_time']
+                    
+                    # 显示观测数据摘要（仍需要获取当前观测用于显示）
+                    obs = self.get_observation(prompt)
+                    joint_pos = obs["observation/joint_position"]
+                    gripper_pos = obs["observation/gripper_position"]
+                    image_shape = obs["observation/exterior_image_1_left"].shape
+                    print(f"  📊 观测摘要: 图像{image_shape}, 关节位置{joint_pos.shape}, 夹爪位置{gripper_pos.shape}")
+                else:
+                    # 没有缓存结果，进行同步预测
+                    print("🔄 进行同步预测...")
+                    obs = self.get_observation(prompt)
+                    
+                    # 显示观测数据摘要
+                    joint_pos = obs["observation/joint_position"]
+                    gripper_pos = obs["observation/gripper_position"]
+                    image_shape = obs["observation/exterior_image_1_left"].shape
+                    print(f"  📊 观测摘要: 图像{image_shape}, 关节位置{joint_pos.shape}, 夹爪位置{gripper_pos.shape}")
+                    
+                    # 使用openpi_client发送到服务器并接收动作
+                    print("📡 正在发送观测数据到服务器...")
+                    start_time = time.time()
+                    action_data = self.policy.infer(obs)
+                    inference_time = time.time() - start_time
                 
                 print("📥 收到服务器响应:")
                 print(f"   - 响应类型: {type(action_data)}")
