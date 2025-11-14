@@ -410,6 +410,22 @@ class YahboomPi05Client:
                 print("📥 收到服务器响应:")
                 print(f"   - 响应类型: {type(action_data)}")
                 print(f"   - 网络往返时间: {inference_time:.3f}s")
+                # 根据任务生成子任务
+                if prompt.startswith("pick up the red block"):
+                    sub_task = "pick up the red block"
+                elif prompt.startswith("pick up the green block"):
+                    sub_task = "pick up the green block"
+                elif prompt.startswith("pick up  the yellow block"):
+                    sub_task = "place the yellow block"
+                elif prompt.startswith("pick up  the yellow block"):
+                    sub_task = "place the yellow block"
+                elif prompt.startswith("how many"):
+                    sub_task = "four blocks"
+                elif prompt.startswith("what color"):
+                    sub_task = "red、green、yellow、…"
+                else:
+                    sub_task = prompt
+                print(f"sub_task: {sub_task}")
                 
                 # 显示服务器响应的统计信息
                 actions = action_data.get('actions', [])
