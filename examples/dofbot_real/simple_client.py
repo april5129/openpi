@@ -136,7 +136,7 @@ def main():
     parser.add_argument("--host", default="127.0.0.1", help="服务器IP")
     parser.add_argument("--port", type=int, default=8000, help="服务器端口")
     parser.add_argument("--image", default="/root/ljw/openpi/examples/dofbot_real/test.jpg", help="图像文件路径")
-    parser.add_argument("--prompt", default="pick up the object", help="任务描述")
+    parser.add_argument("--prompt", default="how many block are there", help="任务描述")
     
     args = parser.parse_args()
     
