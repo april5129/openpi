@@ -99,6 +99,14 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
+        # 初始化 tokenizer 用于子任务文本解码
+        from openpi.models.tokenizer import PaligemmaTokenizer
+        self.tokenizer = PaligemmaTokenizer(max_len=config.max_token_len)
+        
+        # 保存 embedding table 用于解码（从 embedder 中提取）
+        # 这个会在模型加载后被设置
+        self._embedding_table = None
+
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
 
@@ -234,7 +242,23 @@ class Pi0(_model.BaseModel):
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+        # _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+        (prefix_out, suffix_out), kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions) 
+        
+        # VLM introspection: decode what the model is "thinking" in natural language
+        # 参考 github 上 Issue #679 的实现
+        if prefix_out is not None:
+            logits = self.PaliGemma.llm(prefix_out, method="decode")
+            token_ids = jnp.argmax(logits, axis=-1)
+            # Use debug callback to decode text outside JIT context
+            def decode_and_print(token_ids_array):
+                try:
+                    token_list = token_ids_array.tolist()
+                    decoded_text = self.tokenizer._tokenizer.decode(token_list)
+                    print(f"VLM decoded text (inference): {decoded_text}")
+                except Exception as e:
+                    print(f"VLM decoding error (inference): {e}")
+            jax.debug.callback(decode_and_print, token_ids[0])
 
         def step(carry):
             x_t, time = carry
