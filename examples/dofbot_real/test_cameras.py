@@ -7,7 +7,7 @@ import cv2
 import numpy as np
 import os
 
-def test_camera(camera_id, save_dir="/examples/dofbot_real/images"):
+def test_camera(camera_id, save_dir="examples/dofbot_real/images"):
     """测试指定ID的摄像头"""
     print(f"\n测试摄像头 ID={camera_id}")
     print("-" * 50)
