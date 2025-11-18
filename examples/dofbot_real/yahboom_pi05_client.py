@@ -40,9 +40,17 @@ class YahboomPi05Client:
     # 安全的初始位置 (度) - 避免奇异点和碰撞
     SAFE_POSITION = [90, 135, 0, 1, 89, 3]  # 更安全的姿态
     
-    def __init__(self, server_host="wss://torie-nonefficient-darkly.ngrok-free.dev", server_port=443):
+    def __init__(self, server_host="wss://torie-nonefficient-darkly.ngrok-free.dev", server_port=443, 
+                 wrist_camera_id=0, exterior_camera_id=1):
         self.arm = Arm_Device()
         time.sleep(0.1)
+        
+        # 摄像头配置
+        self.wrist_camera_id = wrist_camera_id      # 机械臂上的摄像头 (Microdia USB 2.0 Camera)
+        self.exterior_camera_id = exterior_camera_id  # 空中全局摄像头 (Realtek Integrated Webcam)
+        print(f"📷 摄像头配置:")
+        print(f"   - 机械臂摄像头 (wrist): /dev/video{wrist_camera_id}")
+        print(f"   - 全局摄像头 (exterior): /dev/video{exterior_camera_id}")
         
         # 移动到安全位置
         print("🔧 移动机械臂到安全位置...")
@@ -73,24 +81,37 @@ class YahboomPi05Client:
         )
         print(f"✅ 连接成功! 服务器元数据: {self.policy.get_server_metadata()}")
     
-    def _save_images(self, original_frame, processed_frame):
-        """保存原始图像和处理后的图像"""
+    def _save_images(self, wrist_original, wrist_processed, exterior_original, exterior_processed):
+        """保存两个摄像头的原始图像和处理后的图像"""
         try:
             # 生成时间戳
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             
-            # 保存原始图像（BGR格式）
-            original_filename = f"step_{self.step_counter:04d}_{timestamp}_original.jpg"
-            original_path = os.path.join(self.images_dir, original_filename)
-            cv2.imwrite(original_path, original_frame)
+            # 保存机械臂摄像头图像（BGR格式）
+            wrist_original_filename = f"step_{self.step_counter:04d}_{timestamp}_wrist_original.jpg"
+            wrist_original_path = os.path.join(self.images_dir, wrist_original_filename)
+            cv2.imwrite(wrist_original_path, wrist_original)
             
-            # 保存处理后的图像（需要转换回BGR格式）
-            processed_bgr = cv2.cvtColor(processed_frame, cv2.COLOR_RGB2BGR)
-            processed_filename = f"step_{self.step_counter:04d}_{timestamp}_processed.jpg"
-            processed_path = os.path.join(self.images_dir, processed_filename)
-            cv2.imwrite(processed_path, processed_bgr)
+            # 保存机械臂摄像头处理后的图像（需要转换回BGR格式）
+            wrist_processed_bgr = cv2.cvtColor(wrist_processed, cv2.COLOR_RGB2BGR)
+            wrist_processed_filename = f"step_{self.step_counter:04d}_{timestamp}_wrist_processed.jpg"
+            wrist_processed_path = os.path.join(self.images_dir, wrist_processed_filename)
+            cv2.imwrite(wrist_processed_path, wrist_processed_bgr)
             
-            print(f"💾 已保存图像: {original_filename} & {processed_filename}")
+            # 保存全局摄像头图像（BGR格式）
+            exterior_original_filename = f"step_{self.step_counter:04d}_{timestamp}_exterior_original.jpg"
+            exterior_original_path = os.path.join(self.images_dir, exterior_original_filename)
+            cv2.imwrite(exterior_original_path, exterior_original)
+            
+            # 保存全局摄像头处理后的图像（需要转换回BGR格式）
+            exterior_processed_bgr = cv2.cvtColor(exterior_processed, cv2.COLOR_RGB2BGR)
+            exterior_processed_filename = f"step_{self.step_counter:04d}_{timestamp}_exterior_processed.jpg"
+            exterior_processed_path = os.path.join(self.images_dir, exterior_processed_filename)
+            cv2.imwrite(exterior_processed_path, exterior_processed_bgr)
+            
+            print(f"💾 已保存图像:")
+            print(f"   - 机械臂视角: {wrist_original_filename} & {wrist_processed_filename}")
+            print(f"   - 全局视角: {exterior_original_filename} & {exterior_processed_filename}")
             
         except Exception as e:
             print(f"⚠️  图像保存失败: {e}")
@@ -114,25 +135,38 @@ class YahboomPi05Client:
 
     def get_observation(self, prompt="pick up the object"):
         """获取当前观测 - 图像+关节状态+提示"""
-        # 读取摄像头
-        cap = cv2.VideoCapture(0)
-        ret, frame = cap.read()
-        cap.release()
+        # 读取机械臂摄像头 (wrist camera)
+        wrist_cap = cv2.VideoCapture(self.wrist_camera_id)
+        wrist_ret, wrist_frame = wrist_cap.read()
+        wrist_cap.release()
         
-        if not ret:
-            # 没摄像头就用黑图
-            frame = np.zeros((480, 640, 3), dtype=np.uint8)
-            original_frame = frame.copy()
+        # 读取全局摄像头 (exterior camera)
+        exterior_cap = cv2.VideoCapture(self.exterior_camera_id)
+        exterior_ret, exterior_frame = exterior_cap.read()
+        exterior_cap.release()
+        
+        # 处理机械臂摄像头图像
+        if not wrist_ret:
+            print("⚠️ 机械臂摄像头读取失败，使用黑色图像")
+            wrist_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+            wrist_original = wrist_frame.copy()
         else:
-            # 保存原始图像（BGR格式，用于保存）
-            original_frame = frame.copy()
-            
-            # 处理图像用于发送给服务器
-            frame = cv2.resize(frame, (224, 224))
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            wrist_original = wrist_frame.copy()
+            wrist_frame = cv2.resize(wrist_frame, (224, 224))
+            wrist_frame = cv2.cvtColor(wrist_frame, cv2.COLOR_BGR2RGB)
+        
+        # 处理全局摄像头图像
+        if not exterior_ret:
+            print("⚠️ 全局摄像头读取失败，使用黑色图像")
+            exterior_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+            exterior_original = exterior_frame.copy()
+        else:
+            exterior_original = exterior_frame.copy()
+            exterior_frame = cv2.resize(exterior_frame, (224, 224))
+            exterior_frame = cv2.cvtColor(exterior_frame, cv2.COLOR_BGR2RGB)
         
         # 保存图像到本地
-        self._save_images(original_frame, frame)
+        self._save_images(wrist_original, wrist_frame, exterior_original, exterior_frame)
         
         # 读取关节角度
         for i in range(6):
@@ -158,8 +192,8 @@ class YahboomPi05Client:
         
         # 构建观测 - 按DROID格式
         obs = {
-            "observation/exterior_image_1_left": frame,  # numpy数组
-            "observation/wrist_image_left": frame,  # 用同一个图像
+            "observation/exterior_image_1_left": exterior_frame,  # 全局摄像头图像
+            "observation/wrist_image_left": wrist_frame,  # 机械臂摄像头图像
             "observation/joint_position": np.array(joint_positions, dtype=np.float32),  # 7个关节
             "observation/gripper_position": np.array([gripper_pos], dtype=np.float32),
             "prompt": prompt
@@ -172,8 +206,8 @@ class YahboomPi05Client:
         
         # 打印图像信息
         print(f"🖼️  图像信息:")
-        print(f"   - 图像形状: {frame.shape}")
-        print(f"   - 图像数据类型: {frame.dtype}")
+        print(f"   - 机械臂摄像头 (wrist): {wrist_frame.shape}, {wrist_frame.dtype}")
+        print(f"   - 全局摄像头 (exterior): {exterior_frame.shape}, {exterior_frame.dtype}")
         
         # 打印原始关节角度
         print(f"🔧 原始关节角度 (度):")
@@ -450,7 +484,8 @@ def main():
     parser.add_argument("--host", default="wss://torie-nonefficient-darkly.ngrok-free.dev", help="服务器IP")
     parser.add_argument("--port", type=int, default=443, help="服务器端口")
     parser.add_argument("--task", default="pick up the object", help="任务描述")
-    parser.add_argument("--camera", type=int, default=0, help="摄像头ID")
+    parser.add_argument("--wrist-camera", type=int, default=0, help="机械臂摄像头ID (Microdia USB 2.0 Camera)")
+    parser.add_argument("--exterior-camera", type=int, default=1, help="全局摄像头ID (Realtek Integrated Webcam)")
     
     args = parser.parse_args()
     
@@ -458,7 +493,12 @@ def main():
     print(f"服务器: {args.host}:{args.port}")
     print(f"任务: {args.task}")
     
-    client = YahboomPi05Client(args.host, args.port)
+    client = YahboomPi05Client(
+        args.host, 
+        args.port, 
+        wrist_camera_id=args.wrist_camera,
+        exterior_camera_id=args.exterior_camera
+    )
     client.run(args.task)
 
 
