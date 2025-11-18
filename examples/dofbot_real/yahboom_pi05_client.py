@@ -303,16 +303,13 @@ class YahboomPi05Client:
             return
         
         total_steps = len(actions)
-        prediction_trigger_step = 2  # 固定在第7步启动预测
         
-        print(f"🎯 开始执行动作序列，共 {total_steps} 步")
-        if enable_parallel and prompt:
-            print(f"📊 并行策略: 第{prediction_trigger_step}步时启动下一轮预测")
-        else:
-            print("📊 串行执行模式")
+        print(f"🎯 收到 {total_steps} 步动作序列，只执行第 1 步（闭环控制）")
         
-        # 执行完整的动作序列
-        for step_idx, action in enumerate(actions):
+        # 只执行第一步，实现闭环控制
+        actions_to_execute = [actions[0]]
+        
+        for step_idx, action in enumerate(actions_to_execute):
             # DROID动作格式: 8维 (7个关节速度 + 1个夹爪位置)
             if len(action) < 8:
                 print(f"⚠️ 第{step_idx+1}步动作维度不足: {len(action)}, 期望8个，跳过")
@@ -322,7 +319,7 @@ class YahboomPi05Client:
             joint_velocities = action[:7]  # 7个关节的速度
             gripper_position = action[7]   # 夹爪位置
             
-            print(f"  🔧 执行第 {step_idx+1}/{len(actions)} 步")
+            print(f"  🔧 执行动作:")
             print(f"    关节速度: {joint_velocities}")
             print(f"    夹爪位置: {gripper_position}")
             
@@ -372,24 +369,10 @@ class YahboomPi05Client:
             with self.joint_angles_lock:
                 self.joint_angles = [float(a) for a in safe_angles]
             
-            # 🔮 关键优化: 在第7步时启动下一轮预测
-            if (enable_parallel and prompt and 
-                step_idx == prediction_trigger_step - 1 and  # 第7步（索引6）
-                not self.is_predicting):                     # 还没开始预测
-                print(f"🚀 [并行] 在第{step_idx + 1}步启动下一轮预测")
-                self.predict_async(prompt)
-            
-            # 在第7步时启动异步预测
-            if (enable_parallel and prompt and 
-                step_idx + 1 == prediction_trigger_step and 
-                hasattr(self, 'start_async_prediction')):
-                print(f"🔮 第{prediction_trigger_step}步: 启动异步预测下一轮...")
-                self.start_async_prediction(prompt)
-            
             # 等待动作完成
             time.sleep(0.6)  # 与执行时间匹配
         
-        print(f"✅ 动作序列执行完成")
+        print(f"✅ 动作执行完成，准备重新观测")
     
     def print_joint_status(self):
         """打印当前关节状态"""
@@ -410,56 +393,38 @@ class YahboomPi05Client:
                 self.step_counter += 1
                 print(f"\n🚀 === 步骤 {self.step_counter} 开始 ===")
                 
-                # 🔮 检查是否有异步预测结果可用
-                cached_prediction = self.get_next_prediction()
+                # 1️⃣ 获取当前观测（图像 + 关节状态）
+                print("📸 采集观测数据...")
+                obs = self.get_observation(prompt)
                 
-                if cached_prediction:
-                    print(f"⚡ 使用异步预测结果 (步骤 {cached_prediction['step']})")
-                    action_data = cached_prediction['response']
-                    inference_time = cached_prediction['inference_time']
-                    
-                    # 显示观测数据摘要（仍需要获取当前观测用于显示）
-                    obs = self.get_observation(prompt)
-                    joint_pos = obs["observation/joint_position"]
-                    gripper_pos = obs["observation/gripper_position"]
-                    image_shape = obs["observation/exterior_image_1_left"].shape
-                    print(f"  📊 观测摘要: 图像{image_shape}, 关节位置{joint_pos.shape}, 夹爪位置{gripper_pos.shape}")
-                else:
-                    # 没有缓存结果，进行同步预测
-                    print("🔄 进行同步预测...")
-                    obs = self.get_observation(prompt)
-                    
-                    # 显示观测数据摘要
-                    joint_pos = obs["observation/joint_position"]
-                    gripper_pos = obs["observation/gripper_position"]
-                    image_shape = obs["observation/exterior_image_1_left"].shape
-                    print(f"  📊 观测摘要: 图像{image_shape}, 关节位置{joint_pos.shape}, 夹爪位置{gripper_pos.shape}")
-                    
-                    # 使用openpi_client发送到服务器并接收动作
-                    print("📡 正在发送观测数据到服务器...")
-                    start_time = time.time()
-                    action_data = self.policy.infer(obs)
-                    inference_time = time.time() - start_time
+                # 显示观测数据摘要
+                joint_pos = obs["observation/joint_position"]
+                gripper_pos = obs["observation/gripper_position"]
+                exterior_shape = obs["observation/exterior_image_1_left"].shape
+                wrist_shape = obs["observation/wrist_image_left"].shape
+                print(f"  📊 观测摘要:")
+                print(f"     - 全局摄像头: {exterior_shape}")
+                print(f"     - 机械臂摄像头: {wrist_shape}")
+                print(f"     - 关节位置: {joint_pos.shape}")
+                print(f"     - 夹爪位置: {gripper_pos.shape}")
                 
-                print("📥 收到服务器响应:")
-                print(f"   - 响应类型: {type(action_data)}")
-                print(f"   - 网络往返时间: {inference_time:.3f}s")
+                # 2️⃣ 发送到服务器预测动作
+                print("📡 正在发送观测数据到服务器...")
+                start_time = time.time()
+                action_data = self.policy.infer(obs)
+                inference_time = time.time() - start_time
                 
-                # 显示服务器响应的统计信息
+                # 3️⃣ 显示服务器响应
                 actions = action_data.get('actions', [])
-                print(f"📊 步骤 {self.step_counter} 总结:")
-                print(f"   - 动作序列长度: {len(actions)}")
-                if len(actions) > 0:
-                    print(f"   - 首个动作维度: {len(actions[0])}")
-                    print(f"   - 首个动作范围: [{min(actions[0]):.3f}, {max(actions[0]):.3f}]")
-                print(f"   - 策略推理时间: {action_data.get('policy_timing', {}).get('infer_ms', 'N/A')} ms")
-                print(f"   - 服务器推理时间: {action_data.get('server_timing', {}).get('infer_ms', 'N/A')} ms")
+                print(f"📥 收到动作预测: 共 {len(actions)} 步 (推理耗时: {inference_time:.3f}s)")
                 
-                # 执行动作序列
+                # 4️⃣ 执行动作（只执行第一步）
                 self.execute_action(action_data)
                 
-                # 显示执行后的关节状态
+                # 5️⃣ 显示执行后的关节状态
                 self.print_joint_status()
+                
+                print(f"⏱️  本轮总耗时: {time.time() - start_time:.3f}s")
                 
                 # 不需要额外的sleep，因为execute_action已经包含了等待时间
                     
