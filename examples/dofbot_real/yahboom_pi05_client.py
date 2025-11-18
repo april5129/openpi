@@ -8,6 +8,7 @@ import time
 import numpy as np
 import cv2
 import os
+import json
 import threading
 from datetime import datetime
 from Arm_Lib import Arm_Device
@@ -44,6 +45,14 @@ class YahboomPi05Client:
                  wrist_camera_id=0, exterior_camera_id=2, action_horizon=30):
         self.arm = Arm_Device()
         time.sleep(0.1)
+        
+        # 加载归一化统计数据
+        norm_stats_path = os.path.join(os.path.dirname(__file__), "norm_stats.json")
+        with open(norm_stats_path, 'r') as f:
+            norm_data = json.load(f)
+            self.state_stats = norm_data['norm_stats']['state']
+            self.action_stats = norm_data['norm_stats']['actions']
+        print(f"📊 已加载归一化统计数据: {norm_stats_path}")
         
         # 摄像头配置
         self.wrist_camera_id = wrist_camera_id      # 机械臂上的摄像头 (Microdia USB 2.0 Camera)
@@ -115,22 +124,25 @@ class YahboomPi05Client:
         except Exception as e:
             print(f"⚠️  图像保存失败: {e}")
         
-    def normalize_joint_angle(self, joint_idx, angle):
-        """将关节速度归一化到[-1, 1]范围"""
-        min_angle, max_angle = self.JOINT_LIMITS[joint_idx]
-        # 归一化到[-1, 1]: (angle - center) / half_range
-        center = (min_angle + max_angle) / 2.0
-        half_range = (max_angle - min_angle) / 2.0
-        normalized = (angle - center) / half_range
-        return max(-1.0, min(1.0, normalized))
+    def normalize_state(self, state_vector):
+        """使用 z-score 归一化状态（关节位置和夹爪位置）
+        state_vector: [joint_pos_0, ..., joint_pos_6, gripper_pos]
+        使用 state_stats 进行归一化
+        """
+        mean = np.array(self.state_stats['mean'])
+        std = np.array(self.state_stats['std'])
+        normalized = (state_vector - mean) / (std + 1e-6)
+        return normalized
     
-    def denormalize_joint_angle(self, joint_idx, normalized_value):
-        """将归一化值[-1, 1]转换回实际角度"""
-        min_angle, max_angle = self.JOINT_LIMITS[joint_idx]
-        center = (min_angle + max_angle) / 2.0
-        half_range = (max_angle - min_angle) / 2.0
-        angle = normalized_value * half_range + center
-        return max(min_angle, min(max_angle, angle))
+    def denormalize_action(self, action_vector):
+        """反归一化动作（从服务器返回的归一化动作转换为实际动作）
+        action_vector: [joint_vel_0, ..., joint_vel_6, gripper_pos]
+        使用 action_stats 进行反归一化
+        """
+        mean = np.array(self.action_stats['mean'])
+        std = np.array(self.action_stats['std'])
+        denormalized = action_vector * (std + 1e-6) + mean
+        return denormalized
 
     def get_observation(self, prompt="pick up the object"):
         """获取当前观测 - 图像+关节状态+提示"""
@@ -167,34 +179,42 @@ class YahboomPi05Client:
         # 保存图像到本地
         self._save_images(wrist_original, wrist_frame, exterior_original, exterior_frame)
         
-        # 读取关节速度
+        # 读取关节角度
         for i in range(6):
             angle = self.arm.Arm_serial_servo_read(i + 1)
             if angle is not None:
                 self.joint_angles[i] = float(angle)
         
-        # 使用改进的归一化算法处理关节位置
-        joint_positions = []
-        for i in range(5):  # 前5个关节
+        # 构建原始状态向量 (DROID格式: 7个关节位置 + 1个夹爪位置)
+        # Dofbot只有5个关节 + 1个夹爪，需要补齐到7个关节
+        raw_state = np.zeros(8, dtype=np.float32)
+        
+        # 填充前5个关节（Dofbot的实际关节）
+        for i in range(5):
             if i < len(self.joint_angles):
-                normalized = self.normalize_joint_angle(i, self.joint_angles[i])
-                joint_positions.append(normalized)
-            else:
-                joint_positions.append(0.0)
+                raw_state[i] = self.joint_angles[i]
         
-        # 补齐到7维 (DROID格式) - 添加两个虚拟腕部关节
-        joint_positions.extend([0.0, 0.0])  # 第6、7关节设为0 (无对应硬件)
+        # 第6、7个关节设为0（Dofbot没有这些关节）
+        raw_state[5] = 0.0
+        raw_state[6] = 0.0
         
-        # 夹爪位置 (单独处理)
+        # 第8维：夹爪位置
         gripper_angle = self.joint_angles[5] if len(self.joint_angles) > 5 else 90.0
-        gripper_pos = self.normalize_joint_angle(5, gripper_angle)
+        raw_state[7] = gripper_angle
+        
+        # 使用 norm_stats 进行归一化
+        normalized_state = self.normalize_state(raw_state)
+        
+        # 分离成 joint_position 和 gripper_position
+        joint_positions = normalized_state[:7]  # 前7维
+        gripper_pos = normalized_state[7:8]     # 第8维
         
         # 构建观测 - 按DROID格式
         obs = {
             "observation/exterior_image_1_left": exterior_frame,  # 全局摄像头图像
             "observation/wrist_image_left": wrist_frame,  # 机械臂摄像头图像
-            "observation/joint_position": np.array(joint_positions, dtype=np.float32),  # 7个关节
-            "observation/gripper_position": np.array([gripper_pos], dtype=np.float32),
+            "observation/joint_position": joint_positions.astype(np.float32),  # 7个关节
+            "observation/gripper_position": gripper_pos.astype(np.float32),    # 1个夹爪
             "prompt": prompt,
             "action_horizon": self.action_horizon  # 指定预测步数
         }
@@ -215,20 +235,11 @@ class YahboomPi05Client:
             print(f"   - 关节{i+1}: {angle:.2f}°")
         
         # 打印归一化后的关节位置
-        print(f"📐 归一化关节位置 [-1,1]:")
-        joint_pos_array = obs["observation/joint_position"]
-        for i, pos in enumerate(joint_pos_array):
-            if i < 5:
-                original_angle = self.joint_angles[i]
-                print(f"   - 关节{i+1}: {pos:.3f} (原始: {original_angle:.2f}°)")
-            else:
-                print(f"   - 关节{i+1}: {pos:.3f} (填充值)")
-        
-        # 打印夹爪信息
-        gripper_array = obs["observation/gripper_position"]
-        print(f"🤏 夹爪位置:")
-        print(f"   - 原始角度: {self.joint_angles[5]:.2f}°")
-        print(f"   - 归一化位置: {gripper_array[0]:.3f}")
+        print(f"📐 归一化状态向量 (使用 norm_stats):")
+        print(f"   - 原始状态: {raw_state}")
+        print(f"   - 归一化后: {normalized_state}")
+        print(f"   - joint_position (前7维): {joint_positions}")
+        print(f"   - gripper_position (第8维): {gripper_pos}")
         
         # 打印任务提示
         print(f"💬 任务提示: '{prompt}'")
@@ -270,50 +281,50 @@ class YahboomPi05Client:
         
         # 只执行前N步
         for step_idx in range(steps_to_execute):
-            action = actions[step_idx]
+            action = np.array(actions[step_idx])
             # DROID动作格式: 8维 (7个关节速度 + 1个夹爪位置)
             if len(action) < 8:
                 print(f"⚠️ 第{step_idx+1}步动作维度不足: {len(action)}, 期望8个，跳过")
                 continue
             
+            # 反归一化动作：从服务器返回的归一化动作 → 实际动作
+            denorm_action = self.denormalize_action(action)
+            
             # 提取关节速度 (前7个) 和夹爪位置 (第8个)
-            joint_velocities = action[:7]  # 7个关节的速度
-            gripper_position = action[7]   # 夹爪位置
+            joint_velocities = denorm_action[:7]  # 7个关节的速度（已反归一化）
+            gripper_position = denorm_action[7]   # 夹爪位置（已反归一化）
             
             print(f"  🔧 执行第 {step_idx + 1}/{steps_to_execute} 步:")
-            print(f"    关节速度: {joint_velocities}")
-            print(f"    夹爪位置: {gripper_position}")
+            print(f"    归一化动作: {action}")
+            print(f"    反归一化后:")
+            print(f"      关节速度: {joint_velocities}")
+            print(f"      夹爪位置: {gripper_position}")
             
             # 将速度转换为位置增量 (简单积分)
-            # 速度范围假设为[-1, 1]，转换为角度增量
             # DROID 控制频率: 30Hz，时间步长 dt = 1/30 秒
             dt = 1.0 / 30.0  # 时间步长（秒）
-            velocity_scale = 180.0  # 速度缩放因子（度/秒）- 归一化速度1.0对应180度/秒
             
             angles = []
             for i in range(5):  # 只处理前5个关节 (对应Dofbot的前5个关节)
                 if i < len(joint_velocities):
                     # 当前角度 + 速度增量
                     velocity = joint_velocities[i]
-                    # 限制速度增量 (防止过大的跳跃)
-                    velocity = max(-0.3, min(0.3, velocity))  # 限制归一化速度
                     
                     # 计算新角度: 当前角度 + 速度 * 时间步长
-                    # angle_increment = velocity (归一化) * velocity_scale (度/秒) * dt (秒)
                     current_angle = self.joint_angles[i]
-                    angle_increment = velocity * velocity_scale * dt
+                    angle_increment = velocity * dt
                     new_angle = current_angle + angle_increment
                     
-                    # 使用精确的关节限制
-                    new_angle = self.denormalize_joint_angle(i, 
-                        self.normalize_joint_angle(i, new_angle))
+                    # 限制角度在有效范围内
+                    min_angle, max_angle = self.JOINT_LIMITS[i]
+                    new_angle = max(min_angle, min(max_angle, new_angle))
                     angles.append(int(new_angle))
                 else:
                     angles.append(int(self.joint_angles[i]))
             
-            # 处理夹爪 (使用位置控制，不是速度)
-            gripper_angle = self.denormalize_joint_angle(5, gripper_position)
-            angles.append(int(gripper_angle))
+            # 处理夹爪 (gripper_position 是目标夹爪角度)
+            gripper_angle = max(0, min(180, int(gripper_position)))
+            angles.append(gripper_angle)
             
             # 安全检查 - 确保所有角度在有效范围内
             safe_angles = []
