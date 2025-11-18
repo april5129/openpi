@@ -41,16 +41,18 @@ class YahboomPi05Client:
     SAFE_POSITION = [90, 135, 0, 1, 89, 3]  # 更安全的姿态
     
     def __init__(self, server_host="wss://torie-nonefficient-darkly.ngrok-free.dev", server_port=443, 
-                 wrist_camera_id=0, exterior_camera_id=2):
+                 wrist_camera_id=0, exterior_camera_id=2, action_horizon=30):
         self.arm = Arm_Device()
         time.sleep(0.1)
         
         # 摄像头配置
         self.wrist_camera_id = wrist_camera_id      # 机械臂上的摄像头 (Microdia USB 2.0 Camera)
         self.exterior_camera_id = exterior_camera_id  # 空中全局摄像头 (Realtek Integrated Webcam)
+        self.action_horizon = action_horizon  # 每次预测的动作步数
         print(f"📷 摄像头配置:")
         print(f"   - 机械臂摄像头 (wrist): /dev/video{wrist_camera_id}")
         print(f"   - 全局摄像头 (exterior): /dev/video{exterior_camera_id}")
+        print(f"🎯 动作预测步数: {action_horizon} 步")
         
         # 移动到安全位置
         print("🔧 移动机械臂到安全位置...")
@@ -117,7 +119,7 @@ class YahboomPi05Client:
             print(f"⚠️  图像保存失败: {e}")
         
     def normalize_joint_angle(self, joint_idx, angle):
-        """将关节角度归一化到[-1, 1]范围"""
+        """将关节速度归一化到[-1, 1]范围"""
         min_angle, max_angle = self.JOINT_LIMITS[joint_idx]
         # 归一化到[-1, 1]: (angle - center) / half_range
         center = (min_angle + max_angle) / 2.0
@@ -168,7 +170,7 @@ class YahboomPi05Client:
         # 保存图像到本地
         self._save_images(wrist_original, wrist_frame, exterior_original, exterior_frame)
         
-        # 读取关节角度
+        # 读取关节速度
         for i in range(6):
             angle = self.arm.Arm_serial_servo_read(i + 1)
             if angle is not None:
@@ -196,7 +198,8 @@ class YahboomPi05Client:
             "observation/wrist_image_left": wrist_frame,  # 机械臂摄像头图像
             "observation/joint_position": np.array(joint_positions, dtype=np.float32),  # 7个关节
             "observation/gripper_position": np.array([gripper_pos], dtype=np.float32),
-            "prompt": prompt
+            "prompt": prompt,
+            "action_horizon": self.action_horizon  # 指定预测步数
         }
         
         # 🔍 详细调试输出 - 打印发送给服务器的所有数据
@@ -232,6 +235,7 @@ class YahboomPi05Client:
         
         # 打印任务提示
         print(f"💬 任务提示: '{prompt}'")
+        print(f"🎯 动作预测步数: {self.action_horizon} 步")
         
         # 打印观测字典的键和数据类型
         print(f"📋 观测数据结构:")
@@ -239,7 +243,7 @@ class YahboomPi05Client:
             if isinstance(value, np.ndarray):
                 print(f"   - {key}: {type(value).__name__} {value.shape} {value.dtype}")
             else:
-                print(f"   - {key}: {type(value).__name__} = '{value}'")
+                print(f"   - {key}: {type(value).__name__} = {value}")
         
         print("="*60)
         
@@ -303,13 +307,14 @@ class YahboomPi05Client:
             return
         
         total_steps = len(actions)
+        prediction_trigger_step = 15  # 在第15步启动下一轮预测
         
-        print(f"🎯 收到 {total_steps} 步动作序列，只执行第 1 步（闭环控制）")
+        print(f"🎯 开始执行 {total_steps} 步动作序列")
+        if enable_parallel and prompt:
+            print(f"🔮 将在第 {prediction_trigger_step} 步时启动下一轮异步预测")
         
-        # 只执行第一步，实现闭环控制
-        actions_to_execute = [actions[0]]
-        
-        for step_idx, action in enumerate(actions_to_execute):
+        # 执行所有动作
+        for step_idx, action in enumerate(actions):
             # DROID动作格式: 8维 (7个关节速度 + 1个夹爪位置)
             if len(action) < 8:
                 print(f"⚠️ 第{step_idx+1}步动作维度不足: {len(action)}, 期望8个，跳过")
@@ -319,23 +324,28 @@ class YahboomPi05Client:
             joint_velocities = action[:7]  # 7个关节的速度
             gripper_position = action[7]   # 夹爪位置
             
-            print(f"  🔧 执行动作:")
+            print(f"  🔧 执行第 {step_idx + 1}/{total_steps} 步:")
             print(f"    关节速度: {joint_velocities}")
             print(f"    夹爪位置: {gripper_position}")
             
             # 将速度转换为位置增量 (简单积分)
             # 速度范围假设为[-1, 1]，转换为角度增量
+            # DROID 控制频率: 30Hz，时间步长 dt = 1/30 秒
+            dt = 1.0 / 30.0  # 时间步长（秒）
+            velocity_scale = 180.0  # 速度缩放因子（度/秒）- 归一化速度1.0对应180度/秒
+            
             angles = []
             for i in range(5):  # 只处理前5个关节 (对应Dofbot的前5个关节)
                 if i < len(joint_velocities):
                     # 当前角度 + 速度增量
                     velocity = joint_velocities[i]
                     # 限制速度增量 (防止过大的跳跃)
-                    velocity = max(-0.3, min(0.3, velocity))  # 限制最大速度
+                    velocity = max(-0.3, min(0.3, velocity))  # 限制归一化速度
                     
-                    # 计算新角度 (当前角度 + 速度增量 * 时间步长)
+                    # 计算新角度: 当前角度 + 速度 * 时间步长
+                    # angle_increment = velocity (归一化) * velocity_scale (度/秒) * dt (秒)
                     current_angle = self.joint_angles[i]
-                    angle_increment = velocity * 15.0  # 15度最大增量
+                    angle_increment = velocity * velocity_scale * dt
                     new_angle = current_angle + angle_increment
                     
                     # 使用精确的关节限制
@@ -369,10 +379,17 @@ class YahboomPi05Client:
             with self.joint_angles_lock:
                 self.joint_angles = [float(a) for a in safe_angles]
             
+            # 🔮 在第15步时启动下一轮异步预测
+            if (enable_parallel and prompt and 
+                step_idx + 1 == prediction_trigger_step and 
+                not self.is_predicting):
+                print(f"🚀 [并行] 在第 {step_idx + 1} 步启动下一轮异步预测")
+                self.predict_async(prompt)
+            
             # 等待动作完成
             time.sleep(0.6)  # 与执行时间匹配
         
-        print(f"✅ 动作执行完成，准备重新观测")
+        print(f"✅ 动作序列执行完成")
     
     def print_joint_status(self):
         """打印当前关节状态"""
@@ -393,40 +410,53 @@ class YahboomPi05Client:
                 self.step_counter += 1
                 print(f"\n🚀 === 步骤 {self.step_counter} 开始 ===")
                 
-                # 1️⃣ 获取当前观测（图像 + 关节状态）
-                print("📸 采集观测数据...")
-                obs = self.get_observation(prompt)
-                
-                # 显示观测数据摘要
-                joint_pos = obs["observation/joint_position"]
-                gripper_pos = obs["observation/gripper_position"]
-                exterior_shape = obs["observation/exterior_image_1_left"].shape
-                wrist_shape = obs["observation/wrist_image_left"].shape
-                print(f"  📊 观测摘要:")
-                print(f"     - 全局摄像头: {exterior_shape}")
-                print(f"     - 机械臂摄像头: {wrist_shape}")
-                print(f"     - 关节位置: {joint_pos.shape}")
-                print(f"     - 夹爪位置: {gripper_pos.shape}")
-                
-                # 2️⃣ 发送到服务器预测动作
-                print("📡 正在发送观测数据到服务器...")
                 start_time = time.time()
-                action_data = self.policy.infer(obs)
-                inference_time = time.time() - start_time
+                
+                # 🔮 检查是否有异步预测结果可用
+                cached_prediction = self.get_next_prediction()
+                
+                if cached_prediction:
+                    # 使用缓存的异步预测结果
+                    print(f"⚡ 使用异步预测结果 (在上一轮第15步时已启动)")
+                    action_data = cached_prediction['response']
+                    inference_time = cached_prediction['inference_time']
+                else:
+                    # 没有缓存结果，进行同步预测
+                    print("🔄 进行同步预测...")
+                    
+                    # 1️⃣ 获取当前观测（图像 + 关节状态）
+                    print("📸 采集观测数据...")
+                    obs = self.get_observation(prompt)
+                    
+                    # 显示观测数据摘要
+                    joint_pos = obs["observation/joint_position"]
+                    gripper_pos = obs["observation/gripper_position"]
+                    exterior_shape = obs["observation/exterior_image_1_left"].shape
+                    wrist_shape = obs["observation/wrist_image_left"].shape
+                    print(f"  📊 观测摘要:")
+                    print(f"     - 全局摄像头: {exterior_shape}")
+                    print(f"     - 机械臂摄像头: {wrist_shape}")
+                    print(f"     - 关节位置: {joint_pos.shape}")
+                    print(f"     - 夹爪位置: {gripper_pos.shape}")
+                    
+                    # 2️⃣ 发送到服务器预测动作
+                    print("📡 正在发送观测数据到服务器...")
+                    inference_start = time.time()
+                    action_data = self.policy.infer(obs)
+                    inference_time = time.time() - inference_start
                 
                 # 3️⃣ 显示服务器响应
                 actions = action_data.get('actions', [])
                 print(f"📥 收到动作预测: 共 {len(actions)} 步 (推理耗时: {inference_time:.3f}s)")
                 
-                # 4️⃣ 执行动作（只执行第一步）
-                self.execute_action(action_data)
+                # 4️⃣ 执行动作序列（会在第15步启动下一轮异步预测）
+                self.execute_action(action_data, prompt=prompt, enable_parallel=True)
                 
                 # 5️⃣ 显示执行后的关节状态
                 self.print_joint_status()
                 
                 print(f"⏱️  本轮总耗时: {time.time() - start_time:.3f}s")
                 
-                # 不需要额外的sleep，因为execute_action已经包含了等待时间
                     
         except KeyboardInterrupt:
             print("\n🛑 用户中断")
@@ -451,6 +481,7 @@ def main():
     parser.add_argument("--prompt", default="pick up the object", help="任务描述")
     parser.add_argument("--wrist-camera", type=int, default=0, help="机械臂摄像头ID (Microdia USB 2.0 Camera)")
     parser.add_argument("--exterior-camera", type=int, default=2, help="全局摄像头ID (Realtek Integrated Webcam)")
+    parser.add_argument("--action-horizon", type=int, default=30, help="每次预测的动作步数")
     
     args = parser.parse_args()
     
@@ -462,7 +493,8 @@ def main():
         args.host, 
         args.port, 
         wrist_camera_id=args.wrist_camera,
-        exterior_camera_id=args.exterior_camera
+        exterior_camera_id=args.exterior_camera,
+        action_horizon=args.action_horizon
     )
     client.run(args.prompt)
 
