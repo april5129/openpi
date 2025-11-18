@@ -483,7 +483,7 @@ def main():
     parser = argparse.ArgumentParser(description="Yahboom机械臂 + pi0.5远程控制")
     parser.add_argument("--host", default="wss://torie-nonefficient-darkly.ngrok-free.dev", help="服务器IP")
     parser.add_argument("--port", type=int, default=443, help="服务器端口")
-    parser.add_argument("--task", default="pick up the object", help="任务描述")
+    parser.add_argument("--prompt", default="pick up the object", help="任务描述")
     parser.add_argument("--wrist-camera", type=int, default=0, help="机械臂摄像头ID (Microdia USB 2.0 Camera)")
     parser.add_argument("--exterior-camera", type=int, default=2, help="全局摄像头ID (Realtek Integrated Webcam)")
     
@@ -491,7 +491,7 @@ def main():
     
     print("🤖 Yahboom机械臂 + pi0.5远程控制系统")
     print(f"服务器: {args.host}:{args.port}")
-    print(f"任务: {args.task}")
+    print(f"任务: {args.prompt}")
     
     client = YahboomPi05Client(
         args.host, 
@@ -499,7 +499,7 @@ def main():
         wrist_camera_id=args.wrist_camera,
         exterior_camera_id=args.exterior_camera
     )
-    client.run(args.task)
+    client.run(args.prompt)
 
 
 if __name__ == "__main__":
