@@ -356,8 +356,7 @@ class YahboomPi05Client:
         print("🔧 当前关节状态:")
         for i, (name, angle) in enumerate(zip(self.JOINT_NAMES, self.joint_angles)):
             min_angle, max_angle = self.JOINT_LIMITS[i]
-            normalized = self.normalize_joint_angle(i, angle)
-            print(f"  {name:15}: {angle:6.1f}° (范围: {min_angle:3.0f}-{max_angle:3.0f}°, 归一化: {normalized:+.3f})")
+            print(f"  {name:15}: {angle:6.1f}° (范围: {min_angle:3.0f}-{max_angle:3.0f}°)")
 
     def run(self, prompt="pick up the red block"):
         """主循环 - 使用openpi_client执行控制"""
