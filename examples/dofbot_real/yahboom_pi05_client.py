@@ -303,7 +303,7 @@ class YahboomPi05Client:
             return
         
         total_steps = len(actions)
-        prediction_trigger_step = 7  # 固定在第7步启动预测
+        prediction_trigger_step = 1  # 固定在第7步启动预测
         
         print(f"🎯 开始执行动作序列，共 {total_steps} 步")
         if enable_parallel and prompt:
@@ -365,7 +365,7 @@ class YahboomPi05Client:
             self.arm.Arm_serial_servo_write6(
                 safe_angles[0], safe_angles[1], safe_angles[2], 
                 safe_angles[3], safe_angles[4], safe_angles[5], 
-                600  # 600ms执行时间，平滑但不太慢
+                600  # 600ms执行时间
             )
             
             # 更新状态
