@@ -303,7 +303,7 @@ class YahboomPi05Client:
             return
         
         total_steps = len(actions)
-        prediction_trigger_step = 1  # 固定在第7步启动预测
+        prediction_trigger_step = 2  # 固定在第7步启动预测
         
         print(f"🎯 开始执行动作序列，共 {total_steps} 步")
         if enable_parallel and prompt:
