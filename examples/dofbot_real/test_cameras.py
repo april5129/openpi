@@ -53,7 +53,7 @@ def main():
     
     # 只测试已知的两个摄像头
     cam0_ok = test_camera(0)  # Microdia USB 2.0 Camera (机械臂上)
-    cam2_ok = test_camera(2)  # Realtek Integrated Webcam (空中全局)
+    cam2_ok = test_camera(2)  # arc  (空中全局)
     
     print("\n" + "="*50)
     print("测试总结:")

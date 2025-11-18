@@ -63,11 +63,8 @@ class YahboomPi05Client:
         # 当前状态 - 使用安全位置初始化
         self.joint_angles = list(self.SAFE_POSITION)
         
-        # 并行执行相关状态
+        # 状态管理
         self.joint_angles_lock = threading.Lock()  # 保护关节状态的锁
-        self.next_prediction = None  # 存储下一轮预测结果
-        self.prediction_lock = threading.Lock()  # 保护预测结果的锁
-        self.is_predicting = False  # 是否正在进行预测
         
         # 设置图像保存目录
         self.images_dir = "/home/yahboom/openpi/examples/dofbot_real/images"
@@ -249,48 +246,8 @@ class YahboomPi05Client:
         
         return obs
     
-    def predict_async(self, prompt):
-        """异步预测下一轮动作"""
-        def prediction_worker():
-            try:
-                print("🔮 [异步] 开始下一轮预测...")
-                observation = self.get_observation(prompt)
-                if observation is None:
-                    print("⚠️ [异步] 无法获取观测数据")
-                    return
-                
-                start_time = time.time()
-                response = self.policy.infer(observation)
-                inference_time = time.time() - start_time
-                
-                with self.prediction_lock:
-                    self.next_prediction = {
-                        'response': response,
-                        'inference_time': inference_time,
-                        'step': self.step_counter + 1
-                    }
-                
-                print(f"🔮 [异步] 预测完成，耗时 {inference_time:.3f}s")
-                
-            except Exception as e:
-                print(f"❌ [异步] 预测失败: {e}")
-            finally:
-                self.is_predicting = False
-        
-        if not self.is_predicting:
-            self.is_predicting = True
-            thread = threading.Thread(target=prediction_worker, daemon=True)
-            thread.start()
-    
-    def get_next_prediction(self):
-        """获取异步预测的结果"""
-        with self.prediction_lock:
-            result = self.next_prediction
-            self.next_prediction = None
-            return result
-    
-    def execute_action(self, action_data, prompt=None, enable_parallel=True):
-        """执行动作序列，支持并行预测下一轮"""
+    def execute_action(self, action_data, steps_to_execute=15):
+        """执行动作序列的前N步"""
         if action_data is None:
             print("⚠️ 收到空的动作数据")
             return
@@ -307,14 +264,13 @@ class YahboomPi05Client:
             return
         
         total_steps = len(actions)
-        prediction_trigger_step = 15  # 在第15步启动下一轮预测
+        steps_to_execute = min(steps_to_execute, total_steps)
         
-        print(f"🎯 开始执行 {total_steps} 步动作序列")
-        if enable_parallel and prompt:
-            print(f"🔮 将在第 {prediction_trigger_step} 步时启动下一轮异步预测")
+        print(f"🎯 收到 {total_steps} 步动作序列，执行前 {steps_to_execute} 步")
         
-        # 执行所有动作
-        for step_idx, action in enumerate(actions):
+        # 只执行前N步
+        for step_idx in range(steps_to_execute):
+            action = actions[step_idx]
             # DROID动作格式: 8维 (7个关节速度 + 1个夹爪位置)
             if len(action) < 8:
                 print(f"⚠️ 第{step_idx+1}步动作维度不足: {len(action)}, 期望8个，跳过")
@@ -324,7 +280,7 @@ class YahboomPi05Client:
             joint_velocities = action[:7]  # 7个关节的速度
             gripper_position = action[7]   # 夹爪位置
             
-            print(f"  🔧 执行第 {step_idx + 1}/{total_steps} 步:")
+            print(f"  🔧 执行第 {step_idx + 1}/{steps_to_execute} 步:")
             print(f"    关节速度: {joint_velocities}")
             print(f"    夹爪位置: {gripper_position}")
             
@@ -379,17 +335,10 @@ class YahboomPi05Client:
             with self.joint_angles_lock:
                 self.joint_angles = [float(a) for a in safe_angles]
             
-            # 🔮 在第15步时启动下一轮异步预测
-            if (enable_parallel and prompt and 
-                step_idx + 1 == prediction_trigger_step and 
-                not self.is_predicting):
-                print(f"🚀 [并行] 在第 {step_idx + 1} 步启动下一轮异步预测")
-                self.predict_async(prompt)
-            
             # 等待动作完成
             time.sleep(0.6)  # 与执行时间匹配
         
-        print(f"✅ 动作序列执行完成")
+        print(f"✅ 执行完成 {steps_to_execute} 步动作")
     
     def print_joint_status(self):
         """打印当前关节状态"""
@@ -412,45 +361,22 @@ class YahboomPi05Client:
                 
                 start_time = time.time()
                 
-                # 🔮 检查是否有异步预测结果可用
-                cached_prediction = self.get_next_prediction()
+                # 1️⃣ 获取当前观测（图像 + 关节状态）
+                print("📸 采集观测数据...")
+                obs = self.get_observation(prompt)
                 
-                if cached_prediction:
-                    # 使用缓存的异步预测结果
-                    print(f"⚡ 使用异步预测结果 (在上一轮第15步时已启动)")
-                    action_data = cached_prediction['response']
-                    inference_time = cached_prediction['inference_time']
-                else:
-                    # 没有缓存结果，进行同步预测
-                    print("🔄 进行同步预测...")
-                    
-                    # 1️⃣ 获取当前观测（图像 + 关节状态）
-                    print("📸 采集观测数据...")
-                    obs = self.get_observation(prompt)
-                    
-                    # 显示观测数据摘要
-                    joint_pos = obs["observation/joint_position"]
-                    gripper_pos = obs["observation/gripper_position"]
-                    exterior_shape = obs["observation/exterior_image_1_left"].shape
-                    wrist_shape = obs["observation/wrist_image_left"].shape
-                    print(f"  📊 观测摘要:")
-                    print(f"     - 全局摄像头: {exterior_shape}")
-                    print(f"     - 机械臂摄像头: {wrist_shape}")
-                    print(f"     - 关节位置: {joint_pos.shape}")
-                    print(f"     - 夹爪位置: {gripper_pos.shape}")
-                    
-                    # 2️⃣ 发送到服务器预测动作
-                    print("📡 正在发送观测数据到服务器...")
-                    inference_start = time.time()
-                    action_data = self.policy.infer(obs)
-                    inference_time = time.time() - inference_start
+                # 2️⃣ 发送到服务器预测30步动作
+                print("📡 正在发送观测数据到服务器...")
+                inference_start = time.time()
+                action_data = self.policy.infer(obs)
+                inference_time = time.time() - inference_start
                 
                 # 3️⃣ 显示服务器响应
                 actions = action_data.get('actions', [])
                 print(f"📥 收到动作预测: 共 {len(actions)} 步 (推理耗时: {inference_time:.3f}s)")
                 
-                # 4️⃣ 执行动作序列（会在第15步启动下一轮异步预测）
-                self.execute_action(action_data, prompt=prompt, enable_parallel=True)
+                # 4️⃣ 执行前15步动作
+                self.execute_action(action_data, steps_to_execute=15)
                 
                 # 5️⃣ 显示执行后的关节状态
                 self.print_joint_status()
