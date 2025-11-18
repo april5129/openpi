@@ -40,7 +40,7 @@ class YahboomPi05Client:
     # 安全的初始位置 (度) - 避免奇异点和碰撞
     SAFE_POSITION = [90, 135, 0, 1, 89, 3]  # 更安全的姿态
     
-    def __init__(self, server_host="wss://torie-nonefficient-darkly.ngrok-free.dev", server_port=8000):
+    def __init__(self, server_host="wss://torie-nonefficient-darkly.ngrok-free.dev", server_port=443):
         self.arm = Arm_Device()
         time.sleep(0.1)
         
@@ -448,7 +448,7 @@ def main():
     
     parser = argparse.ArgumentParser(description="Yahboom机械臂 + pi0.5远程控制")
     parser.add_argument("--host", default="wss://torie-nonefficient-darkly.ngrok-free.dev", help="服务器IP")
-    parser.add_argument("--port", type=int, default=8000, help="服务器端口")
+    parser.add_argument("--port", type=int, default=443, help="服务器端口")
     parser.add_argument("--task", default="pick up the object", help="任务描述")
     parser.add_argument("--camera", type=int, default=0, help="摄像头ID")
     
