@@ -41,7 +41,7 @@ class YahboomPi05Client:
     SAFE_POSITION = [90, 135, 0, 1, 89, 3]  # 更安全的姿态
     
     def __init__(self, server_host="wss://torie-nonefficient-darkly.ngrok-free.dev", server_port=443, 
-                 wrist_camera_id=0, exterior_camera_id=1):
+                 wrist_camera_id=0, exterior_camera_id=2):
         self.arm = Arm_Device()
         time.sleep(0.1)
         
@@ -485,7 +485,7 @@ def main():
     parser.add_argument("--port", type=int, default=443, help="服务器端口")
     parser.add_argument("--task", default="pick up the object", help="任务描述")
     parser.add_argument("--wrist-camera", type=int, default=0, help="机械臂摄像头ID (Microdia USB 2.0 Camera)")
-    parser.add_argument("--exterior-camera", type=int, default=1, help="全局摄像头ID (Realtek Integrated Webcam)")
+    parser.add_argument("--exterior-camera", type=int, default=2, help="全局摄像头ID (Realtek Integrated Webcam)")
     
     args = parser.parse_args()
     
